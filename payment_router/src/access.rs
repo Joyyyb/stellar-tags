@@ -129,18 +129,60 @@ pub fn require_fee_authority(env: &Env) -> Result<(), Error> {
 
 // ── Circuit Breaker & Emergency Checks ───────────────────────────────────────
 
-pub fn is_paused_internal(env: &Env) -> bool {
-    env.storage()
+/// Read the current [`PauseLevel`] from storage.
+///
+/// For backward compatibility the legacy boolean `DataKey::Paused` is
+/// consulted first: if it is `true` the effective level is
+/// [`PauseLevel::FullHalt`]; otherwise the new `DataKey::PauseLevel` key is
+/// used (defaulting to `PauseLevel::None` when absent).
+pub fn get_pause_level(env: &Env) -> crate::types::PauseLevel {
+    use crate::types::PauseLevel;
+    // Legacy boolean migration path.
+    let legacy: bool = env
+        .storage()
         .instance()
         .get(&DataKey::Paused)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if legacy {
+        return PauseLevel::FullHalt;
+    }
+    let raw: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::PauseLevel)
+        .unwrap_or(0u32);
+    PauseLevel::from_u32(raw).unwrap_or(PauseLevel::None)
 }
 
-pub fn require_circuit_closed(env: &Env) -> Result<(), Error> {
-    if is_paused_internal(env) {
+/// Legacy helper retained for call-sites that only need a yes/no "is anything
+/// paused" answer. Returns `true` when the level is *not* `PauseLevel::None`.
+pub fn is_paused_internal(env: &Env) -> bool {
+    get_pause_level(env) != crate::types::PauseLevel::None
+}
+
+/// Reject the call if the contract is at [`PauseLevel::FullHalt`].
+/// Direct payments are still allowed under [`PauseLevel::SwapsOnly`].
+pub fn require_not_full_halt(env: &Env) -> Result<(), Error> {
+    use crate::types::PauseLevel;
+    if get_pause_level(env) == PauseLevel::FullHalt {
         return Err(Error::Paused);
     }
     Ok(())
+}
+
+/// Reject the call if any pause level is active (i.e. swaps are blocked under
+/// both [`PauseLevel::SwapsOnly`] and [`PauseLevel::FullHalt`]).
+pub fn require_swaps_unpaused(env: &Env) -> Result<(), Error> {
+    use crate::types::PauseLevel;
+    if get_pause_level(env) != PauseLevel::None {
+        return Err(Error::Paused);
+    }
+    Ok(())
+}
+
+/// Kept for legacy call-sites that check "is the contract entirely halted".
+pub fn require_circuit_closed(env: &Env) -> Result<(), Error> {
+    require_not_full_halt(env)
 }
 
 pub fn is_frozen_internal(env: &Env) -> bool {

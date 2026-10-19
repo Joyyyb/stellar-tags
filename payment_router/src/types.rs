@@ -1,5 +1,36 @@
 use soroban_sdk::{contractclient, contracttype, Address, BytesN, Env, Vec};
 
+/// Tiered circuit-breaker levels for the payment router (issue #890).
+///
+/// Stored as a `u32` in instance storage under [`crate::storage::DataKey::PauseLevel`].
+/// The numeric values are stable and form part of the on-chain ABI: never
+/// renumber existing variants.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PauseLevel {
+    /// Contract is fully operational; all routing calls are accepted.
+    None = 0,
+    /// DEX-swap routing is blocked; direct [`route_payment`] /
+    /// [`route_payments`] calls continue to function normally.
+    SwapsOnly = 1,
+    /// Full halt; all routing calls — direct and swap-based — are rejected.
+    FullHalt = 2,
+}
+
+impl PauseLevel {
+    /// Convert a raw `u32` discriminant into a `PauseLevel`, returning
+    /// `None` for values outside the defined range.
+    pub fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            0 => Some(PauseLevel::None),
+            1 => Some(PauseLevel::SwapsOnly),
+            2 => Some(PauseLevel::FullHalt),
+            _ => None,
+        }
+    }
+}
+
 /// A user's rolling 24-hour spending record.
 ///
 /// Retained purely so existing test snapshots that reference this type by

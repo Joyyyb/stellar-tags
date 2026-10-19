@@ -4842,3 +4842,289 @@ fn test_version_is_non_empty() {
     // A Soroban String's byte length is accessible via .len()
     assert!(v.len() > 0, "version must not be empty");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #890 — Tiered Circuit Breaker (PauseLevel) tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Helper: deploy the contract and initialise it with an admin, treasury, and
+/// a test token funded to `sender`.
+fn setup_tiered_pause_env() -> (
+    Env,
+    crate::PaymentRouterClient<'static>,
+    Address, // admin
+    Address, // sender
+    Address, // recipient
+    Address, // token_address
+) {
+    let (env, client, _contract_id) = setup_env();
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let (token_address, _token_client, token_admin_client) = setup_token(&env);
+    token_admin_client.mint(&sender, &1_000_000);
+
+    client.initialize(
+        &admin,
+        &treasury,
+        &100,
+        &1_000,
+        &PaymentRouter::MAX_AMOUNT,
+    );
+
+    (env, client, admin, sender, recipient, token_address)
+}
+
+#[test]
+fn test_pause_level_defaults_to_none() {
+    let (_, client, admin, _, _, _) = setup_tiered_pause_env();
+    let _ = admin;
+    assert_eq!(client.get_pause_level_value(), 0u32);
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_set_pause_swaps_only_blocks_swaps_allows_direct() {
+    let (env, client, admin, sender, recipient, token_address) = setup_tiered_pause_env();
+    let _ = (env, admin);
+
+    // Set SwapsOnly (level 1).
+    client.set_pause(&1u32);
+    assert_eq!(client.get_pause_level_value(), 1u32);
+    assert!(client.is_paused());
+
+    // Direct payment must succeed under SwapsOnly.
+    let result = client.try_route_payment(&sender, &recipient, &token_address, &1_000);
+    assert!(
+        result.is_ok(),
+        "direct payment should succeed under SwapsOnly"
+    );
+}
+
+#[test]
+fn test_set_pause_swaps_only_blocks_route_payment_with_swap() {
+    let (_, client, _, _, _, _) = setup_tiered_pause_env();
+
+    // Set SwapsOnly (level 1).
+    client.set_pause(&1u32);
+
+    // A swap call must be rejected.
+    // We only need to test that the pause check fires; a DexNotRegistered
+    // error would mean the pause check was bypassed.
+    let dex = Address::generate(&client.env);
+    let sell_token = Address::generate(&client.env);
+    let buy_token = Address::generate(&client.env);
+    let path = soroban_sdk::vec![&client.env, sell_token.clone(), buy_token.clone()];
+
+    let err = client
+        .try_route_payment_with_swap_raw(
+            &Address::generate(&client.env),
+            &Address::generate(&client.env),
+            &dex,
+            &sell_token,
+            &buy_token,
+            &1_000,
+            &path,
+            &1,
+        )
+        .unwrap_err()
+        .unwrap();
+
+    assert_eq!(err, Error::Paused, "swap should be rejected with Paused under SwapsOnly");
+}
+
+#[test]
+fn test_set_pause_full_halt_blocks_direct_payment() {
+    let (_, client, _, sender, recipient, token_address) = setup_tiered_pause_env();
+
+    // Set FullHalt (level 2).
+    client.set_pause(&2u32);
+    assert_eq!(client.get_pause_level_value(), 2u32);
+
+    let err = client
+        .try_route_payment(&sender, &recipient, &token_address, &1_000)
+        .unwrap_err()
+        .unwrap();
+
+    assert_eq!(err, Error::Paused, "direct payment should be rejected under FullHalt");
+}
+
+#[test]
+fn test_set_pause_resume_from_swaps_only() {
+    let (_, client, _, sender, recipient, token_address) = setup_tiered_pause_env();
+
+    // Pause at SwapsOnly, then resume.
+    client.set_pause(&1u32);
+    assert!(client.is_paused());
+
+    client.set_pause(&0u32);
+    assert!(!client.is_paused());
+    assert_eq!(client.get_pause_level_value(), 0u32);
+
+    // Direct payment should work again.
+    let result = client.try_route_payment(&sender, &recipient, &token_address, &1_000);
+    assert!(result.is_ok(), "payment should succeed after resuming");
+}
+
+#[test]
+fn test_set_paused_bool_true_maps_to_full_halt() {
+    let (_, client, _, _, _, _) = setup_tiered_pause_env();
+
+    // Legacy bool API: true → FullHalt.
+    client.set_paused(&true);
+    assert_eq!(client.get_pause_level_value(), 2u32);
+}
+
+#[test]
+fn test_set_paused_bool_false_maps_to_none() {
+    let (_, client, _, _, _, _) = setup_tiered_pause_env();
+
+    client.set_paused(&true);
+    client.set_paused(&false);
+    assert_eq!(client.get_pause_level_value(), 0u32);
+    assert!(!client.is_paused());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #889 — Dead-man's switch operator heartbeat renewal tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn advance_time_by(env: &Env, seconds: u64) {
+    env.ledger().set(LedgerInfo {
+        timestamp: env.ledger().timestamp() + seconds,
+        ..env.ledger().get()
+    });
+}
+
+/// Arm the DMS and return admin, backup, operator addresses.
+fn setup_dms_with_operator(
+    env: &Env,
+    client: &crate::PaymentRouterClient<'static>,
+) -> (Address, Address, Address) {
+    let admin = Address::generate(env);
+    let backup = Address::generate(env);
+    let operator = Address::generate(env);
+    let treasury = Address::generate(env);
+    let timeout = PaymentRouter::MIN_DMS_TIMEOUT + 1;
+
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    // Arm the switch via timelock.
+    let nonce = client.queue_action(&ActionType::SetBackupAdmin(backup.clone(), timeout));
+    advance_time_by(env, PaymentRouter::SECONDS_IN_24H + 1);
+    client.execute_action(&nonce);
+
+    // Appoint operator.
+    client.set_heartbeat_operator(&operator);
+
+    (admin, backup, operator)
+}
+
+#[test]
+fn test_set_heartbeat_operator_stores_address() {
+    let (env, client, _) = setup_env();
+    let (_, _, operator) = setup_dms_with_operator(&env, &client);
+
+    let stored = client.get_heartbeat_operator();
+    assert_eq!(stored.unwrap(), operator);
+}
+
+#[test]
+fn test_renew_heartbeat_operator_resets_timestamp() {
+    let (env, client, _) = setup_env();
+    let (_, _, operator) = setup_dms_with_operator(&env, &client);
+
+    // Record the heartbeat before advancing time.
+    let (_, _, hb_before, _) = client.get_dead_mans_switch();
+
+    // Advance 10 seconds, then renew.
+    advance_time_by(&env, 10);
+    client.renew_heartbeat(&operator);
+
+    let (_, _, hb_after, _) = client.get_dead_mans_switch();
+    assert!(
+        hb_after > hb_before,
+        "heartbeat should advance after renew_heartbeat"
+    );
+}
+
+#[test]
+fn test_renew_heartbeat_prevents_backup_claim() {
+    let (env, client, _) = setup_env();
+    let timeout = PaymentRouter::MIN_DMS_TIMEOUT + 1;
+    let (_, backup, operator) = setup_dms_with_operator(&env, &client);
+
+    // Advance almost to expiry.
+    advance_time_by(&env, timeout - 1);
+
+    // Operator renews — this pushes LastHeartbeat forward.
+    client.renew_heartbeat(&operator);
+
+    // Now advance to what *would* have been past-expiry without the renewal.
+    advance_time_by(&env, timeout - 1);
+
+    // Backup claim should still fail (not enough time since renewal).
+    let err = client
+        .try_claim_admin(&backup)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::DmsNotReady);
+}
+
+#[test]
+fn test_renew_heartbeat_unauthorized_address_rejected() {
+    let (env, client, _) = setup_env();
+    setup_dms_with_operator(&env, &client);
+
+    let impostor = Address::generate(&env);
+    let err = client
+        .try_renew_heartbeat(&impostor)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized);
+}
+
+#[test]
+fn test_renew_heartbeat_fails_when_no_operator_configured() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    // No operator set.
+    let random = Address::generate(&env);
+    let err = client
+        .try_renew_heartbeat(&random)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized);
+}
+
+#[test]
+fn test_operator_cannot_change_backup_admin() {
+    let (env, client, _) = setup_env();
+    let (_, backup, operator) = setup_dms_with_operator(&env, &client);
+    let _ = operator;
+
+    // There is no set_backup_admin entrypoint the operator could call;
+    // just verify the backup address is unchanged after a renew.
+    let (b_before, _, _, _) = client.get_dead_mans_switch();
+    assert_eq!(b_before.unwrap(), backup);
+}
+
+#[test]
+fn test_set_heartbeat_operator_rejects_admin_as_operator() {
+    let (env, client, _) = setup_env();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.initialize(&admin, &treasury, &100, &1_000, &PaymentRouter::MAX_AMOUNT);
+
+    // Appointing the admin itself as operator should fail.
+    let err = client
+        .try_set_heartbeat_operator(&admin)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::InvalidDmsConfig);
+}

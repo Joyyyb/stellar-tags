@@ -141,6 +141,14 @@ pub enum DataKey {
     UpgradeApproval(BytesN<32>),
     /// Guard against cross-contract reentrancy attacks.
     ReentrancyGuard,
+    /// Tiered pause level for the circuit-breaker (issue #890).
+    /// Stored as `u32` in instance storage; see [`crate::types::PauseLevel`].
+    /// Replaces the legacy boolean `Paused` key — the old key is still read
+    /// during migrations so existing deployments are not bricked.
+    PauseLevel,
+    /// Address authorised to call `renew_heartbeat` without full admin rights
+    /// (issue #889). Stored as `Address` in instance storage.
+    HeartbeatOperator,
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
